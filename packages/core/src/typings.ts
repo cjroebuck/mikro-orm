@@ -25,6 +25,7 @@ import type { Type, types } from './types/index.js';
 import type { Platform } from './platforms/Platform.js';
 import type { Configuration } from './utils/Configuration.js';
 import type { Raw } from './utils/RawQueryFragment.js';
+export type { Raw };
 import { Utils } from './utils/Utils.js';
 import { EntityComparator } from './utils/EntityComparator.js';
 import type { EntityManager } from './EntityManager.js';
@@ -568,19 +569,43 @@ export type EntityDTO<T, C extends TypeConfig = never> = {
 
 type TargetKeys<T> = T extends EntityClass<infer P> ? keyof P : keyof T;
 type PropertyName<T> = IsUnknown<T> extends false ? TargetKeys<T> : string;
-type TableName = { name: string; schema?: string; toString: () => string };
 export type FormulaTable = { alias: string; name: string; schema?: string; qualifiedName: string; toString: () => string };
 
-export type IndexCallback<T> = (table: TableName, columns: Record<PropertyName<T>, string>, indexName: string) => string | Raw;
-export type FormulaCallback<T> = (table: FormulaTable, columns: Record<PropertyName<T>, string>) => string;
+/**
+ * Table reference for schema callbacks (indexes, checks, generated columns).
+ * Unlike FormulaTable, this has no alias since schema generation doesn't use query aliases.
+ */
+export type SchemaTable = { name: string; schema?: string; qualifiedName: string; toString: () => string };
 
-export type CheckCallback<T> = (columns: Record<PropertyName<T>, string>) => string;
-export type GeneratedColumnCallback<T> = (columns: Record<keyof T, string>) => string;
+/**
+ * Column mapping for formula callbacks. Maps property names to fully-qualified alias.fieldName.
+ * Has toString() returning the main alias for backwards compatibility with old formula syntax.
+ * @example
+ * // New recommended syntax - use cols.propName for fully-qualified references
+ * formula: cols => `${cols.firstName} || ' ' || ${cols.lastName}`
+ *
+ * // Old syntax still works - cols.toString() returns the alias
+ * formula: cols => `${cols}.first_name || ' ' || ${cols}.last_name`
+ */
+export type FormulaColumns<T> = Record<PropertyName<T>, string> & { toString(): string };
+
+/**
+ * Column mapping for schema callbacks (indexes, checks, generated columns).
+ * Maps property names to field names. For TPT entities, only includes properties
+ * that belong to the current table (not inherited properties from parent tables).
+ */
+export type SchemaColumns<T> = Record<PropertyName<T>, string>;
+
+export type IndexCallback<T> = (columns: Record<PropertyName<T>, string>, table: SchemaTable, indexName: string) => string | Raw;
+export type FormulaCallback<T> = (columns: FormulaColumns<T>, table: FormulaTable) => string | Raw;
+
+export type CheckCallback<T> = (columns: Record<PropertyName<T>, string>, table: SchemaTable) => string | Raw;
+export type GeneratedColumnCallback<T> = (columns: Record<PropertyName<T>, string>, table: SchemaTable) => string | Raw;
 
 export interface CheckConstraint<T = any> {
   name?: string;
   property?: string;
-  expression: string | CheckCallback<T>;
+  expression: string | Raw | CheckCallback<T>;
 }
 
 export type AnyString = string & {};
@@ -593,7 +618,7 @@ export interface EntityProperty<Owner = any, Target = any> {
   runtimeType: 'number' | 'string' | 'boolean' | 'bigint' | 'Buffer' | 'Date' | 'object' | 'any' | AnyString;
   targetMeta?: EntityMetadata<Target>;
   columnTypes: string[];
-  generated?: string | GeneratedColumnCallback<Owner>;
+  generated?: string | Raw | GeneratedColumnCallback<Owner>;
   customType?: Type<any>;
   customTypes: (Type<any> | undefined)[];
   hasConvertToJSValueSQL: boolean;
@@ -746,14 +771,53 @@ export class EntityMetadata<Entity = any, Class extends EntityCtor<Entity> = Ent
     return this.properties[this.primaryKeys[0]];
   }
 
-  createColumnMappingObject(): Record<PropertyName<Entity>, string> {
-    return Object.values<EntityProperty>(this.properties).reduce((o, prop) => {
+  /**
+   * Creates a mapping from property names to field names.
+   * @param alias - Optional alias to prefix field names. Can be a string (same for all) or a function (per-property).
+   *                When provided, also adds toString() returning the alias for backwards compatibility with formulas.
+   * @param toStringAlias - Optional alias to return from toString(). Defaults to `alias` when it's a string.
+   */
+  createColumnMappingObject(alias?: string | ((prop: EntityProperty<Entity>) => string), toStringAlias?: string): FormulaColumns<Entity> {
+    const resolveAlias = typeof alias === 'function' ? alias : () => alias;
+    const defaultAlias = toStringAlias ?? (typeof alias === 'string' ? alias : undefined);
+
+    const result = Object.values<EntityProperty>(this.properties).reduce((o, prop) => {
+      if (prop.fieldNames) {
+        const propAlias = resolveAlias(prop);
+        o[prop.name as PropertyName<Entity>] = propAlias ? `${propAlias}.${prop.fieldNames[0]}` : prop.fieldNames[0];
+      }
+
+      return o;
+    }, {} as Record<PropertyName<Entity>, string>);
+
+    // Add toString() for backwards compatibility when alias is provided
+    if (alias) {
+      Object.defineProperty(result, 'toString', {
+        value: () => defaultAlias ?? '',
+        enumerable: false,
+      });
+    }
+
+    return result as FormulaColumns<Entity>;
+  }
+
+  /**
+   * Creates a column mapping for schema callbacks (indexes, checks, generated columns).
+   * For TPT entities, only includes properties that belong to the current table (ownProps).
+   */
+  createSchemaColumnMappingObject(): SchemaColumns<Entity> {
+    // For TPT entities, only include properties that belong to this entity's table
+    const props = this.inheritanceType === 'tpt' && this.ownProps
+      ? this.ownProps
+      : Object.values<EntityProperty>(this.properties);
+
+    return props.reduce((o, prop) => {
       if (prop.fieldNames) {
         o[prop.name as PropertyName<Entity>] = prop.fieldNames[0];
       }
 
       return o;
-    }, {} as Record<PropertyName<Entity>, string>);
+    }, {} as SchemaColumns<Entity>);
   }
 
   get tableName(): string {
@@ -838,9 +902,9 @@ export class EntityMetadata<Entity = any, Class extends EntityCtor<Entity> = Ent
     }
 
     this.definedProperties = this.trackingProps.reduce((o, prop) => {
-      const isReference = (prop.inversedBy || prop.mappedBy) && !prop.mapToPk;
+      const hasInverse = (prop.inversedBy || prop.mappedBy) && !prop.mapToPk;
 
-      if (isReference) {
+      if (hasInverse) {
         // eslint-disable-next-line @typescript-eslint/no-this-alias
         const meta = this;
         o[prop.name] = {
@@ -865,6 +929,18 @@ export class EntityMetadata<Entity = any, Class extends EntityCtor<Entity> = Ent
             }
 
             EntityHelper.propagate(meta, entity, this, prop, Reference.unwrapReference(val), old);
+          },
+          enumerable: true,
+          configurable: true,
+        };
+      } else {
+        // For relations without inverse, still need getter+setter for proper property access
+        o[prop.name] = {
+          get() {
+            return this.__helper.__data[prop.name];
+          },
+          set(val: AnyEntity) {
+            this.__helper.__data[prop.name] = Reference.wrapReference(val, prop as EntityProperty);
           },
           enumerable: true,
           configurable: true,
@@ -982,6 +1058,22 @@ export interface EntityMetadata<Entity = any, Class extends EntityCtor<Entity> =
   polymorphs?: EntityMetadata[];
   root: EntityMetadata<Entity>;
   definedProperties: Dictionary;
+  /** Inheritance type: 'sti' (Single Table Inheritance) or 'tpt' (Table-Per-Type). Only set on root entities. */
+  inheritanceType?: 'sti' | 'tpt';
+  /** For TPT: direct parent entity metadata (the entity this one extends). */
+  tptParent?: EntityMetadata;
+  /** For TPT: direct child entities (entities that extend this one). */
+  tptChildren?: EntityMetadata[];
+  /** For TPT: all non-abstract descendants, sorted by depth (deepest first). Precomputed during discovery. */
+  allTPTDescendants?: EntityMetadata[];
+  /** For TPT: synthetic property representing the join to the parent table (child PK → parent PK). */
+  tptParentProp?: EntityProperty;
+  /** For TPT: inverse of tptParentProp, used for joining from parent to child (parent PK → child PK). */
+  tptInverseProp?: EntityProperty;
+  /** For TPT: virtual discriminator property name (computed at query time, not persisted). */
+  tptDiscriminatorColumn?: string;
+  /** For TPT: properties defined only in THIS entity (not inherited from parent). */
+  ownProps?: EntityProperty<Entity>[];
   // used to make ORM aware of externally defined triggers, can change resulting SQL in some condition like when inserting in mssql
   hasTriggers?: boolean;
   /** @internal can be used for computed numeric cache keys */

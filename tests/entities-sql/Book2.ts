@@ -5,6 +5,7 @@ import {
   Ref,
   OptionalProps,
   QueryOrder,
+  quote,
   ref,
   rel,
   t,
@@ -56,7 +57,7 @@ export class Book2 {
   @Property({ type: t.decimal, precision: 8, scale: 2, nullable: true })
   price?: number;
 
-  @Formula(alias => `${alias}.price * 1.19`)
+  @Formula(cols => quote`${cols.price} * 1.19`)
   priceTaxed?: string;
 
   @Property({ type: t.double, nullable: true })
