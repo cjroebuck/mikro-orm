@@ -6,7 +6,7 @@
 
 import { bench } from '@ark/attest';
 import type { Collection, Ref, PrimaryKeyProp } from '@mikro-orm/core';
-import type { Field, ContextOrderByMap, QBFilterQuery, ModifyHint, ModifyContext } from '@mikro-orm/sql';
+import type { Field, ContextOrderByMap, QBFilterQuery, ModifyHint, ModifyContext, ModifyFields } from '@mikro-orm/sql';
 
 // ============================================
 // Test Entity Definitions
@@ -147,3 +147,30 @@ bench('QBFilterQuery<Author, "a", SimpleContext> - with $and', () => {
     $and: [{ 'b.title': 'test' }, { name: 'foo' }],
   });
 }).types([1932, 'instantiations']);
+
+// ============================================
+// ModifyFields benchmarks (Fields tracking)
+// ============================================
+
+// eslint-disable-next-line no-empty-function
+function useFields<F extends string>(_fields: F): void {}
+
+bench('ModifyFields - no join fields (passthrough)', () => {
+  type Result = ModifyFields<'id' | 'name', 'a', never, 'books', 'b', undefined>;
+  useFields<Result>('' as Result);
+}).types([5, 'instantiations']);
+
+bench('ModifyFields - with join fields (simple)', () => {
+  type Result = ModifyFields<'*', 'a', SimpleContext, 'books', 'b', readonly ['title', 'price']>;
+  useFields<Result>('' as Result);
+}).types([165, 'instantiations']);
+
+bench('ModifyFields - with join fields (accumulate)', () => {
+  type Result = ModifyFields<'id' | 'name', 'a', SimpleContext, 'books', 'b', readonly ['title']>;
+  useFields<Result>('' as Result);
+}).types([153, 'instantiations']);
+
+bench('ModifyFields - nested context', () => {
+  type Result = ModifyFields<'id', 'a', TwoJoinContext, 'tags', 't', readonly ['name']>;
+  useFields<Result>('' as Result);
+}).types([153, 'instantiations']);
